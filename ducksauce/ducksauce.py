@@ -232,7 +232,7 @@ def quacksort(iterator: Iterator[pa.RecordBatch], keys: List[str], output: Union
             score = np.sum(np.array([m[0] for m in malordered]))
             # Randomness avoids getting stuck... but at what cost?
             worst, start, end, description = random.choice(malordered)
-            logger.warning(f"{score} bad, reordering {worst:.0f} from {start} to {end} " + description + "     ")
+            print(f"{score} bad, reordering {worst:.0f} from {start} to {end} " + description + "     ", end = "\r")
             head = tables[:start]
             to_fix = tables[start:end]
             tail = tables[end:]
@@ -328,17 +328,17 @@ def malordered_ranges(files, batch_size):
             # The first file we could safely write out to the left has a maximum value
             # less than right_min.
             might_overlap_left = right_min
-            overlap_left = bisect.bisect_left(maxes, might_overlap_left)
+            overlap_left = bisect.bisect_right(maxes, might_overlap_left)
 
             
             # # The first file we could safely write out to the right
             # has a minimum value greater than left_max, or the highest 
             # already-dropped maximum. (The assymetry is because of how we sort.)
             might_overlap_right = max_to_the_left
-            overlap_right = bisect.bisect_right(mins, might_overlap_right)
+            overlap_right = bisect.bisect_left(mins, might_overlap_right)
 
             # A metric: how many bytes outside this buffer might overlap?
-            extraneousness = (np.sum(byte_counts[overlap_left:overlap_right + 1]) - buff_size)
+            extraneousness = (np.sum(byte_counts[overlap_left:overlap_right]) - buff_size)
             # If it's zero, we could sort in one pass.
             if extraneousness > 0:
                 info.append((extraneousness, left_i, i, f"{overlap_left}<- {left_i} - {i + 1} ->{overlap_right} ({extraneousness:.01f})"))
