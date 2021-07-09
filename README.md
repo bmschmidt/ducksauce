@@ -6,7 +6,7 @@ these cases where I need to sort multi-gigabyte feather/parquet files that can't
 
 ## Command line
 
-python ducksauce.py --key size --input 0.parquet 1.parquet [etc] output.feather
+ducksauce --key size --input 0.parquet 1.parquet [etc] output.feather
 
 
 This is designed for a very particular use case. You start with an iterator over pyarrow record batches (I've build in 

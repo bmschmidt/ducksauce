@@ -9,6 +9,7 @@ import argparse
 import random
 from typing import List, Set, Dict, Tuple, Optional, Iterator, Union
 import logging
+import numpy as np
 logger = logging.getLogger("ducksauce")
 
 def split(batch, key):
@@ -75,6 +76,7 @@ def yield_from_csv(input, block_size):
     yield from f
 
 def yield_from_feather(path):
+    print("Feathering", path)
     inp = ipc.open_file(path)
     for i in range(inp.num_record_batches):
         yield inp.get_batch(i)
@@ -86,17 +88,18 @@ def yield_from_parquet(path):
 def yield_from_file(path):
     if path.suffix == ".parquet":
         yield from yield_from_parquet(path)
-    if path.suffix == ".feather":
+    elif path.suffix == ".feather":
         yield from yield_from_feather(path)
-    if path.suffix == ".csv":
+    elif path.suffix == ".csv":
         yield from yield_from_csv(path)
+    else:
+        raise FileNotFoundError("Huh?", path)
 
 def from_files(files, keys: List[str], output: Union[Path, str], block_size = 2_500_000_000):
     assert not output.exists()
-    for path in files:
-        assert path.exists()
     def iterator():
         for path in files:
+            assert path.exists()
             yield from yield_from_file(path)
     quacksort(iterator(), keys, output, block_size)
     
@@ -127,10 +130,6 @@ def ducksauce(input, **args):
   if input.suffix == ".feather":
       from_feather(input, **args)
 
-def args_ducksauce():
-    assert output.suffix in {".feather", ".parquet"}
-    from_files(**parse_args())
-
 class MyTable():
     def __init__(self, table, dir, key):
         self.path = Path(dir) / (str(uuid.uuid1()) + ".feather")
@@ -152,11 +151,24 @@ class MyTable():
     
     def __getattr__(self, key):
         return self.table.__getattr__(key)
+    
     def __getitem__(self, key):
         return self.table.__getitem__(key)
         
     def set_min_max(self, table, key):
-        self.minmax = pc.min_max(table[key]).as_py()
+        if pa.types.is_integer(table[key].type):
+            self.minmax = pc.min_max(table[key]).as_py()
+        else:
+            # E.g. string, binary.
+            arr = table[key]
+            # Get the min and max the hard way.
+            min = arr.take(pc.partition_nth_indices(arr, pivot = 0))
+            max = arr.take(pc.partition_nth_indices(arr, pivot = len(arr) - 1))
+            # Don't cast to python in case collation would be different.
+            self.minmax = {
+                "min": min,
+                "max": max
+            }
 
     def destroy(self):
         self.path.unlink()
@@ -217,14 +229,17 @@ def quacksort(iterator: Iterator[pa.RecordBatch], keys: List[str], output: Union
             malordered = malordered_ranges(tables, block_size)
             if len(malordered) == 0:
                 break
-            worst = malordered[0]
-            score = sum([m[0] for m in malordered])
-            logger.info(f"{score} bad, reordering {worst} ", end = "\r")
-            head = tables[:worst[1][0]]
-            to_fix = tables[worst[1][0]:worst[1][1]]
-            tail = tables[worst[1][1]:]
+            score = np.sum(np.array([m[0] for m in malordered]))
+            # Randomness avoids getting stuck... but at what cost?
+            worst, start, end, description = random.choice(malordered)
+            logger.warning(f"{score} bad, reordering {worst:.0f} from {start} to {end} " + description + "     ")
+            head = tables[:start]
+            to_fix = tables[start:end]
+            tail = tables[end:]
             if len(to_fix) == 0:
-                to_fix = [tables[worst[1][0]]]
+                logger.warning("to_fix has length 0")
+                to_fix = [tables[start]]
+                tail = tables[start + 1:]
             reorder_table = pa.concat_tables([f.table for f in to_fix])
             new_parts = partition(reorder_table, key, n_splits)
             new_mid = [MyTable(subbatch, tmp_dir, key) for subbatch in new_parts]
@@ -234,6 +249,7 @@ def quacksort(iterator: Iterator[pa.RecordBatch], keys: List[str], output: Union
                     f.destroy()
                 except FileNotFoundError:
                     "WTF?"
+                    raise
                     continue
             tables = head + new_mid + tail
         cache_size = 0
@@ -250,8 +266,8 @@ def quacksort(iterator: Iterator[pa.RecordBatch], keys: List[str], output: Union
                 next_min = tables[i + 1].minmax['min']
             except IndexError:
                 # Max 32-byte float. will need adjustment if ever want to do this on 64 bits.
-                next_min = int(0x7FFFFFFFFFFFFFFF)
-            if cache_size >= block_size or next_min == int(0x7FFFFFFFFFFFFFFF):
+                next_min = None
+            if cache_size >= block_size or next_min is None:
                 if final_outfile is None:
                     if output.suffix == ".feather":
                         final_outfile = ipc.new_file(output, schema = cache[0].schema)
@@ -261,15 +277,19 @@ def quacksort(iterator: Iterator[pa.RecordBatch], keys: List[str], output: Union
                 sort_order = pc.sort_indices(tab[key])
                 tab = tab.take(sort_order)
                 out_num += 1
-                mask = pc.less(tab[key], pa.scalar(next_min, pa.int64()))
-                done = tab.filter(mask)
+                if next_min is not None:
+                    mask = pc.less(tab[key], pa.scalar(next_min, pa.int64()))
+                    done = tab.filter(mask)
+                else:
+                    done = tab
                 if output.suffix == ".feather":
                     for record_batch in done.to_batches():
                         final_outfile.write_batch(record_batch)
                 elif output.suffix == ".parquet":
                     final_outfile.write_table(done)
                 written += done.nbytes
-                leftover = tab.filter(pc.invert(mask))
+                if next_min is not None:
+                    leftover = tab.filter(pc.invert(mask))
 
                 # The cache are values that might be part of the next item.
                 cache = [leftover]
@@ -278,6 +298,7 @@ def quacksort(iterator: Iterator[pa.RecordBatch], keys: List[str], output: Union
         final_outfile.close()
         logger.debug("Sort done.")
 
+import bisect
 
 def malordered_ranges(files, batch_size):
     """
@@ -288,6 +309,12 @@ def malordered_ranges(files, batch_size):
     queue = []
     buff_size = 0
     info = []
+
+    byte_counts = np.array([f.nbytes for f in files])
+
+    mins = [f.minmax['min'] for f in files]
+    maxes = [f.minmax['max'] for f in files]
+    max_to_the_left = 0
     for i, f in enumerate(files):
         right_min = f.minmax['min']
         right_max = f.minmax['max']
@@ -295,11 +322,28 @@ def malordered_ranges(files, batch_size):
         queue.append((right_min, right_max, right_size, i))
         buff_size += f.nbytes
         if buff_size > batch_size:
+            # The leftmost element
             left_min, left_max, left_size, left_i = queue.pop(0)
+            max_to_the_left = max(left_max, max_to_the_left)
+            # The first file we could safely write out to the left has a maximum value
+            # less than right_min.
+            might_overlap_left = right_min
+            overlap_left = bisect.bisect_left(maxes, might_overlap_left)
+
+            
+            # # The first file we could safely write out to the right
+            # has a minimum value greater than left_max, or the highest 
+            # already-dropped maximum. (The assymetry is because of how we sort.)
+            might_overlap_right = max_to_the_left
+            overlap_right = bisect.bisect_right(mins, might_overlap_right)
+
+            # A metric: how many bytes outside this buffer might overlap?
+            extraneousness = (np.sum(byte_counts[overlap_left:overlap_right + 1]) - buff_size)
+            # If it's zero, we could sort in one pass.
+            if extraneousness > 0:
+                info.append((extraneousness, left_i, i, f"{overlap_left}<- {left_i} - {i + 1} ->{overlap_right} ({extraneousness:.01f})"))
             buff_size -= left_size
-            if left_max > right_min:
-                info.append(((left_max - left_min)/(right_max - left_min), (left_i, i + 1), "A"))
-                info.append(((right_max - right_min)/(right_max - left_min), (left_i, i + 1), "B"))
+
     info.sort(reverse = True)
     return info
 
