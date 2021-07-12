@@ -210,7 +210,7 @@ def quacksort(iterator: Iterator[pa.RecordBatch], keys: List[str], output: Union
                 for subbatch in array:
                     tables.append(MyTable(subbatch, tmp_dir, key))
                     n_written += 1
-                logger.debug(n_written, f"batches written to {tmp_dir}")
+                logger.debug(f"{n_written} batches written to {tmp_dir}")
                 cache = []
                 cache_size = 0
         # Flush the cache
@@ -290,10 +290,12 @@ def quacksort(iterator: Iterator[pa.RecordBatch], keys: List[str], output: Union
                 written += done.nbytes
                 if next_min is not None:
                     leftover = tab.filter(pc.invert(mask))
-
-                # The cache are values that might be part of the next item.
-                cache = [leftover]
-                cache_size = leftover.nbytes
+                    # The cache are values that might be part of the next item.
+                    cache = [leftover]
+                    cache_size = leftover.nbytes
+                else:
+                    cache = None
+                    cache_size = 0
         # No need for a final flush
         final_outfile.close()
         logger.debug("Sort done.")
@@ -330,7 +332,6 @@ def malordered_ranges(files, batch_size):
             might_overlap_left = right_min
             overlap_left = bisect.bisect_right(maxes, might_overlap_left)
 
-            
             # # The first file we could safely write out to the right
             # has a minimum value greater than left_max, or the highest 
             # already-dropped maximum. (The assymetry is because of how we sort.)
