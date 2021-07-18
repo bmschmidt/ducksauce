@@ -24,7 +24,10 @@ def split(batch, key):
     batch = batch.combine_chunks()
     mid = random.randint(1, len(batch) - 1)
     mid = len(batch) // 2
-    batch.take([mid])
+    try:
+        batch.take([mid])
+    except pa.ArrowInvalid:
+        return [batch]
     try:
         sort_order = pc.partition_nth_indices(batch[key], options=pc.PartitionNthOptions(mid))
     except:
@@ -96,9 +99,11 @@ def yield_from_file(path):
         raise FileNotFoundError("Huh?", path)
 
 def from_files(files, keys: List[str], output: Union[Path, str], block_size = 2_500_000_000):
+    output = Path(output)
     assert not output.exists()
     def iterator():
         for path in files:
+            path = Path(path)
             assert path.exists()
             yield from yield_from_file(path)
     quacksort(iterator(), keys, output, block_size)
@@ -112,7 +117,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description='Sort some files.')
     parser.add_argument('--key', type=str, action="append",
                         help='The names of the columns to sort on.')
-    parser.add_argument('--block-size', type=int, nargs=1,
+    parser.add_argument('--block-size', type=int,
                         default = 2_500_000_000,
                         help="The maximum size of tables to hold in memory, in bytes. Performance "
                         "depends on making this as big as possible. Default 2_500_000_000 (2.5 gigabytes)")                        
@@ -162,8 +167,8 @@ class MyTable():
             # E.g. string, binary.
             arr = table[key]
             # Get the min and max the hard way.
-            min = arr.take(pc.partition_nth_indices(arr, pivot = 0))
-            max = arr.take(pc.partition_nth_indices(arr, pivot = len(arr) - 1))
+            min = arr.take(pc.partition_nth_indices(arr, pivot = 0))[0].as_py()
+            max = arr.take(pc.partition_nth_indices(arr, pivot = len(arr) - 1))[0].as_py()
             # Don't cast to python in case collation would be different.
             self.minmax = {
                 "min": min,
@@ -197,7 +202,7 @@ def quacksort(iterator: Iterator[pa.RecordBatch], keys: List[str], output: Union
     """ 
     key = keys[0]
     n_written = 0
-    with TemporaryDirectory() as tmp_dir:
+    with TemporaryDirectory(dir=".") as tmp_dir:
         logger.info("Reading initial stream for quacksort.")
         for i, batch in enumerate(iterator):
             n_records += len(batch)
@@ -271,14 +276,16 @@ def quacksort(iterator: Iterator[pa.RecordBatch], keys: List[str], output: Union
                 if final_outfile is None:
                     if output.suffix == ".feather":
                         final_outfile = ipc.new_file(output, schema = cache[0].schema)
-                    if output.suffix == ".parquet":
+                    elif output.suffix == ".parquet":
                         final_outfile = parquet.ParquetWriter(output, schema=cache[0].schema)
+                    else:
+                        raise(f"{output.suffix} not supported")
                 tab = pa.concat_tables(cache)
                 sort_order = pc.sort_indices(tab[key])
                 tab = tab.take(sort_order)
                 out_num += 1
                 if next_min is not None:
-                    mask = pc.less(tab[key], pa.scalar(next_min, pa.int64()))
+                    mask = pc.less(tab[key], pa.scalar(next_min, tab[key].type))
                     done = tab.filter(mask)
                 else:
                     done = tab
@@ -316,7 +323,10 @@ def malordered_ranges(files, batch_size):
 
     mins = [f.minmax['min'] for f in files]
     maxes = [f.minmax['max'] for f in files]
-    max_to_the_left = 0
+    if isinstance(maxes[0], str):
+        max_to_the_left = chr(0)
+    else:
+        max_to_the_left = 0
     for i, f in enumerate(files):
         right_min = f.minmax['min']
         right_max = f.minmax['max']
