@@ -7,7 +7,7 @@ setup(
     version='1.0',
     entry_points={
         'console_scripts': [
-            'ducksauce = ducksauce.__main__'
+            'quacksort = ducksauce.ducksauce:__main__'
         ],
     },
     use_scm_version=True,
