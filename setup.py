@@ -12,7 +12,7 @@ setup(
     },
     use_scm_version=True,
     setup_requires=['setuptools_scm'],
-    description="Fast enough sort of Apache Arrow streams",
+    description="Fast enough sort, for Apache Arrow streams",
     url="http://github.com/bmschmidt/ducksauce",
     author="Benjamin Schmidt",
     author_email="bmschmidt@gmail.com",

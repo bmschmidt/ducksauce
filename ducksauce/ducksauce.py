@@ -10,68 +10,179 @@ import random
 from typing import List, Set, Dict, Tuple, Optional, Iterator, Union
 import logging
 import numpy as np
+import bisect
+import random
+import numpy as np
+from .utils import total_batch_size, total_batch_nrows, min_val, max_val, tb_min, tb_max, vec_gte, \
+    Tablet, get_pivot, consume_tablets, partition, flatten
+
 logger = logging.getLogger("ducksauce")
 
-def split(batch, key):
-    """
-    Partition (not sort) a table into front half, back half.
-    Time complexity is greatly reduced by using partition rather than sort.
-    
-    Memory usage here is unclear to me. 
-    """
-    if len(batch) < 3:
-        return [batch]
-    batch = batch.combine_chunks()
-    mid = random.randint(1, len(batch) - 1)
-    mid = len(batch) // 2
-    try:
-        batch.take([mid])
-    except pa.ArrowInvalid:
-        return [batch]
-    try:
-        sort_order = pc.partition_nth_indices(batch[key], options=pc.PartitionNthOptions(mid))
-    except:
-        logger.error("Couldn't partition", mid, batch[key])
-        raise
-    front = batch.take(sort_order[0:mid])
-    end = batch.take(sort_order[mid:])
-    return [front, end]
+            
+def tmpdata(n = 10000, maxint = 1000, batches = 5):
+    tbs = []
+    tmpdir = Path("/tmp/tablets")
+    for p in tmpdir.glob("*"):
+        p.unlink()
+    tmpdir.mkdir(exist_ok = True)
+    for i in range(batches):
+        tb = pa.table({"A": pa.array(np.random.randint(0, maxint, n)),"B": pa.array(np.random.randint(0, maxint, n))})
+        min = tb_min(tb, keys = keys)
+        max = tb_max(tb, keys = keys)
+        p = Tablet(tb, "/tmp/tablets", min, max, keys)
+        tbs.append(p)
+    return tbs
 
-def partition(batch, key, times = 4):
-    """
-    times: number of splits. Power of 2.
+def subcleave(patab : pa.Table, pivots : List[pa.Scalar], keys):
+    key, *keys_left = keys
+    pivot, *pivots_left = pivots
+    assert pivot.as_py is not None
     
-    Split an array into parts.
-    """
-    array = [batch]
-    for _ in range(2**times):
-        first = array.pop(0)
-        new_items = split(first, key)
-        array += new_items
-        del first
-    return array
+    lesser = pc.filter(patab, pc.less(patab[key], pivot))
+    greater = pc.filter(patab, pc.greater(patab[key], pivot))
+    eq = pc.filter(patab, pc.equal(patab[key], pivot))
+    
+    if len(pivots) == 1:
+        return lesser, pa.concat_tables([greater, eq])
+    
+    lt, gt = subcleave(eq, pivots_left, keys_left)
+    return (
+        pa.concat_tables([lesser, lt]),
+        pa.concat_tables([greater, gt])
+    )
 
-def is_ordered(new_files, batch_size):
+def cleave(tb : Tablet, pivots : List[pa.Scalar], keys : List[str]):
     """
-    Pass over the memorized files to see if the batch
-    size could conceivable write a lower to number to
-    disk before a higher number appears.
+    breaks a tablet object in two around a single pivot point. Objects exactly
+    equal to the pivot will be in the right (greater) table.
     """
-    queue = []
-    buff_size = 0
-    for (min, max, size, _) in new_files:
-        queue.append((min, max, size))
-        buff_size += size
-        if buff_size > batch_size:
-            _, f_max, f_size = queue.pop(0)
-            if f_max > min:
-                return False
-            buff_size -= f_size
+    assert isinstance(tb, Tablet)
+    lesser, greater = subcleave(tb.table, pivots, keys)
+    
+    greater = Tablet(greater, tb.path.parent, min = tb_min(greater, keys), max = tb_max(greater, keys), keys = keys)
+    lesser = Tablet(lesser, tb.path.parent, min = tb_min(lesser, keys), max = tb_max(lesser, keys), keys = keys)
+    if len(greater) == 0:
+        greater = None
+    if len(lesser) == 0:
+        lesser = None
+    if lesser is not None:
+        assert vec_gte(lesser.max, lesser.min)
+    if greater is not None:
+        assert vec_gte(greater.max, greater.min)
+    tb.destroy()
+    return lesser, greater
+
+def split_into(tb : pa.Table, n : int, keys : List[str]) -> List[pa.Table]:
+    tbs = [tb]
+    for i in range(n):
+        tbs.sort(key = lambda x: -len(x))
+        current = tbs.pop(0)
+        # Pick a random pivot
+        if len(current) <= 1:
+            # Unlikey limit case.
+            tbs.append(current)
+            break
+        rix = random.randint(0, len(current)-1)    
+        pivots = [current[k][rix] for k in keys]
+        for part in cleave(current, pivots, keys):
+            if part is not None:
+                tbs.append(part)
+        current.destroy()
+    return tbs
+        # Sort by length so the next split is on the longest array
+
+
+def central_pass(inputs : List[Tablet], keys : List[str], max_overlaps : int = 1024 * 1024 * 1024) -> List[List[Tablet]]:
+    # Choose a random pivot.
+    sorted = []
+    unsorted = [inputs]
+    i = 0
+    while len(unsorted) > 0:
+        i += 1
+        array = unsorted.pop(0)
+        if len(array) == 0:
+            continue
+        if total_batch_size(array) < max_overlaps:
+            array.sort()
+            sorted.append(array)
+            continue
+        size = total_batch_nrows(array)
+        pivot = get_pivot(array, keys)
+        # Split chunks into three: those below the pivot, those overlapping it, and those above.
+        all_before, overlaps, all_after = partition(array, pivot)
+        print(f"{i:04d} COMPLETE: {sum(map(total_batch_size, sorted))}, SAFE: {total_batch_size(all_before)}, overlapping: {total_batch_size(overlaps)}, next: {total_batch_size(all_after)}, stack: {sum(map(total_batch_size, unsorted))}", end = "                                             \r")
+        assert size == sum(map(total_batch_nrows, [all_before, all_after, overlaps]))
+        s1 = []
+        s2 = []
+        while total_batch_size(overlaps) > max_overlaps:
+            current = overlaps.pop()
+            before, eq_or_after = cleave(current, pivot, keys)
+            s1.append(before)
+            s2.append(eq_or_after)
+
+            if total_batch_size(s1) > max_overlaps:
+                t = consume_tablets(*s1, keys = keys)
+                ts = split_into(t, MINISIZE, keys)
+                for t in ts:
+                    t.flush()
+                    all_before.append(t)
+                s1 = []
+            if total_batch_size(s2) > max_overlaps:
+                t = consume_tablets(*s2, keys = keys)
+                ts = split_into(t, MINISIZE, keys)
+                s2 = []
+                for t in ts:
+                    t.flush()
+                    all_after.append(t)
+
+                    
+        assert size == total_batch_nrows([*s1, *s2, *overlaps, *all_before, *all_after])
+        all_before.extend(s1)
+        all_after.extend(s2)
+        unsorted = [u for u in [all_before + overlaps, all_after, *unsorted] if len(u) > 0]
         
-    return True
+        if sum(map(total_batch_size, unsorted)) <= max_overlaps:
+            # The end condition is that the left size is small enough to sort.
+            sorted.extend(unsorted)
+            break
+            
+    return sorted
 
 
-# Better Key: pc.add(tb['_ncid'], pc.multiply(tb['wordid'], pc.add(1, pc.min_max(tb['_ncid'])['max'])))
+def swansong(sorted_nested : List[List[Tablet]], fout : Path, max_overlaps : int, keys : List[str]) -> None:
+    """
+    The last portion of the sort is simple--just move left to 
+    right sorting each portion in turn, secure in the knowledge 
+    that you won't run out.
+    """
+    if fout.suffix == ".feather":
+        writer = ipc.new_file(fout, sorted_nested[0][0].schema)
+    elif fout.suffix == ".parquet":
+        writer = parquet.ParquetWriter(fout, sorted_nested[0][0].schema)
+    stack = []
+    sorted : List[Tablet] = flatten(sorted_nested)
+    i = 0
+    while len(sorted) > 0:
+        i += 1
+        tb = sorted.pop(0)
+        stack.append(tb)
+        if len(sorted) == 0 or total_batch_size(stack + [sorted[0]]) > max_overlaps:
+            combined = consume_tablets(*stack, keys = keys)
+            stack = []
+            if len(sorted) > 0:
+                min_remaining = min_val(*sorted)
+                lesser, greater = cleave(combined, pivots = min_remaining, keys = keys)
+                if greater is not None and len(greater) > 0:
+                    stack = [greater]
+            else:
+                lesser = combined
+            ixes = pc.sort_indices(lesser.table, sort_keys = [(k, "ascending") for k in keys])
+            lesser = pc.take(lesser.table, ixes)
+            writer.write_table(lesser)
+            print(f"{i:04d}: Flushed {lesser.nbytes} bytes with {total_batch_size(stack)} remaining in cache")
+                
+    writer.close()
+
 
 def yield_from_csv(input, block_size):
     f = csv.open_csv(input, read_options = csv.ReadOptions(block_size = block_size),
@@ -79,7 +190,7 @@ def yield_from_csv(input, block_size):
     yield from f
 
 def yield_from_feather(path):
-    print("Feathering", path)
+    logger.debug(f"Reading file from {path}")
     inp = ipc.open_file(path)
     for i in range(inp.num_record_batches):
         yield inp.get_batch(i)
@@ -108,7 +219,7 @@ def from_files(files, keys: List[str], output: Union[Path, str], block_size = 2_
             yield from yield_from_file(path)
     quacksort(iterator(), keys, output, block_size)
     
-def __main__():    
+def __main__():
     args = parse_args()
     print(args)
     from_files(args.inputs, args.key, args.output, args.block_size)
@@ -135,50 +246,45 @@ def ducksauce(input, **args):
   if input.suffix == ".feather":
       from_feather(input, **args)
 
-class MyTable():
-    def __init__(self, table, dir, key):
-        self.path = Path(dir) / (str(uuid.uuid1()) + ".feather")
-        self.minmax = None
-        self.set_min_max(table, key)
-        if self.minmax['min'] is None:
-            raise("foo")
-        self.nbytes = table.nbytes
-        pa.feather.write_feather(table, self.path)
-        self.length = len(table)
-        self._table = None
+MINISIZE = 12
+def pass_1(iterator : Iterator[pa.RecordBatch], keys: List[str], block_size : int, tmpdir : Path):
+    tables = []
+    cache = []
+    logger.info("Reading initial stream for quacksort.")
+    n_records = 0
+    for i, batch in enumerate(iterator):
+        n_records += len(batch)
+        cache.append(batch)
+        if total_batch_size(cache) > block_size:
+            block = pa.Table.from_batches(cache)
+            min = tb_min(block, keys = keys)
+            max = tb_max(block, keys = keys)
+            tab = Tablet(block, tmpdir, min, max, keys)            
+            array = split_into(tab, MINISIZE, keys)
+            for subbatch in array:
+                tables.append(subbatch)
+                # Write it to disk and clear the memory version.
+                subbatch.flush()
+            cache = []
+            cache_size = 0
+    # Flush the cache at the end.
+    if len(cache) > 0:
+        block = pa.Table.from_batches(cache)
+        min = tb_min(block, keys = keys)
+        max = tb_max(block, keys = keys)
+        tab = Tablet(block, tmpdir, min, max, keys)            
+        array = split_into(tab, MINISIZE, keys)
+        for subbatch in array:
+            tables.append(subbatch)
+            # Write it to disk and clear the memory version.
+            subbatch.flush()
+    assert len(tables) > 0
+    assert(n_records == sum([len(f) for f in tables]))
+    return tables
 
-    @property 
-    def table(self):
-        if self._table:
-            return self._table
-        self._table = feather.read_table(self.path, memory_map = True)
-        return self._table
+
+def quacksort(iterator: Iterator[pa.RecordBatch], keys: List[str], output: Union[Path, str], block_size = 2_500_000_000) -> None:
     
-    def __getattr__(self, key):
-        return self.table.__getattr__(key)
-    
-    def __getitem__(self, key):
-        return self.table.__getitem__(key)
-        
-    def set_min_max(self, table, key):
-        if pa.types.is_integer(table[key].type):
-            self.minmax = pc.min_max(table[key]).as_py()
-        else:
-            # E.g. string, binary.
-            arr = table[key]
-            # Get the min and max the hard way.
-            min = arr.take(pc.partition_nth_indices(arr, pivot = 0))[0].as_py()
-            max = arr.take(pc.partition_nth_indices(arr, pivot = len(arr) - 1))[0].as_py()
-            # Don't cast to python in case collation would be different.
-            self.minmax = {
-                "min": min,
-                "max": max
-            }
-
-    def destroy(self):
-        self.path.unlink()
-
-def quacksort(iterator: Iterator[pa.RecordBatch], keys: List[str], output: Union[Path, str], block_size = 2_500_000_000):
     """
     Some kind of multi-pass sorting algorithm that aims to reduce useless ahead-
     of time sorting. 
@@ -193,170 +299,12 @@ def quacksort(iterator: Iterator[pa.RecordBatch], keys: List[str], output: Union
     output = Path(output)
     n_records = 0
     # First pass--simply write to disk.
-    cache_size = 0
-    total_bytes = 0
-    cache = []
-    tables = []
-    """
-    First pass--chunk into files of 1/8 the block size.
-    """ 
-    key = keys[0]
-    n_written = 0
-    with TemporaryDirectory(dir=".") as tmp_dir:
-        logger.info("Reading initial stream for quacksort.")
-        for i, batch in enumerate(iterator):
-            n_records += len(batch)
-            cache_size += batch.nbytes
-            total_bytes += batch.nbytes
-            cache.append(batch)        
-            if cache_size > block_size:
-                block = pa.Table.from_batches(cache)
-                array = partition(block, key, 3)
-                for subbatch in array:
-                    tables.append(MyTable(subbatch, tmp_dir, key))
-                    n_written += 1
-                logger.debug(f"{n_written} batches written to {tmp_dir}")
-                cache = []
-                cache_size = 0
-        # Flush the cache
-        if len(cache) > 0:
-            block = pa.Table.from_batches(cache)
-            array = partition(block, key, 2)
-            for subbatch in array:
-                tables.append(MyTable(subbatch, tmp_dir, key))
-
-        assert(n_records == sum([f.length for f in tables]))
-        
-        n_splits = 3
-        logger.info("Initial stream read: preparing shuffle sort.")
-        while True:
-            tables.sort(key = lambda x: x.minmax['min'])
-            malordered = malordered_ranges(tables, block_size)
-            if len(malordered) == 0:
-                break
-            score = np.sum(np.array([m[0] for m in malordered]))
-            # Randomness avoids getting stuck... but at what cost?
-            worst, start, end, description = random.choice(malordered)
-            print(f"{score} bad, reordering {worst:.0f} from {start} to {end} " + description + "     ", end = "\r")
-            head = tables[:start]
-            to_fix = tables[start:end]
-            tail = tables[end:]
-            if len(to_fix) == 0:
-                logger.warning("to_fix has length 0")
-                to_fix = [tables[start]]
-                tail = tables[start + 1:]
-            reorder_table = pa.concat_tables([f.table for f in to_fix])
-            new_parts = partition(reorder_table, key, n_splits)
-            new_mid = [MyTable(subbatch, tmp_dir, key) for subbatch in new_parts]
-            # Cleanup.
-            for f in to_fix:
-                try:
-                    f.destroy()
-                except FileNotFoundError:
-                    "WTF?"
-                    raise
-                    continue
-            tables = head + new_mid + tail
-        cache_size = 0
-        cache = []
-        out_num = 0
-        written = 0
-        logger.info("Finishing sort.")
-        final_outfile = None
-        for i, tab in enumerate(tables):
-            cache.append(tab.table)
-            cache_size += tab.nbytes
-            tab.destroy()
-            try:
-                next_min = tables[i + 1].minmax['min']
-            except IndexError:
-                # Max 32-byte float. will need adjustment if ever want to do this on 64 bits.
-                next_min = None
-            if cache_size >= block_size or next_min is None:
-                if final_outfile is None:
-                    if output.suffix == ".feather":
-                        final_outfile = ipc.new_file(output, schema = cache[0].schema)
-                    elif output.suffix == ".parquet":
-                        final_outfile = parquet.ParquetWriter(output, schema=cache[0].schema)
-                    else:
-                        raise(f"{output.suffix} not supported")
-                tab = pa.concat_tables(cache)
-                sort_order = pc.sort_indices(tab[key])
-                tab = tab.take(sort_order)
-                out_num += 1
-                if next_min is not None:
-                    mask = pc.less(tab[key], pa.scalar(next_min, tab[key].type))
-                    done = tab.filter(mask)
-                else:
-                    done = tab
-                if output.suffix == ".feather":
-                    for record_batch in done.to_batches():
-                        final_outfile.write_batch(record_batch)
-                elif output.suffix == ".parquet":
-                    final_outfile.write_table(done)
-                written += done.nbytes
-                if next_min is not None:
-                    leftover = tab.filter(pc.invert(mask))
-                    # The cache are values that might be part of the next item.
-                    cache = [leftover]
-                    cache_size = leftover.nbytes
-                else:
-                    cache = None
-                    cache_size = 0
-        # No need for a final flush
-        final_outfile.close()
-        logger.debug("Sort done.")
-
-import bisect
-
-def malordered_ranges(files, batch_size):
-    """
-    Pass over the memorized files to see if the batch
-    size could conceivable write a lower to number to
-    disk before a higher number appears.
-    """
-    queue = []
-    buff_size = 0
-    info = []
-
-    byte_counts = np.array([f.nbytes for f in files])
-
-    mins = [f.minmax['min'] for f in files]
-    maxes = [f.minmax['max'] for f in files]
-    if isinstance(maxes[0], str):
-        max_to_the_left = chr(0)
-    else:
-        max_to_the_left = 0
-    for i, f in enumerate(files):
-        right_min = f.minmax['min']
-        right_max = f.minmax['max']
-        right_size = f.nbytes
-        queue.append((right_min, right_max, right_size, i))
-        buff_size += f.nbytes
-        if buff_size > batch_size:
-            # The leftmost element
-            left_min, left_max, left_size, left_i = queue.pop(0)
-            max_to_the_left = max(left_max, max_to_the_left)
-            # The first file we could safely write out to the left has a maximum value
-            # less than right_min.
-            might_overlap_left = right_min
-            overlap_left = bisect.bisect_right(maxes, might_overlap_left)
-
-            # # The first file we could safely write out to the right
-            # has a minimum value greater than left_max, or the highest 
-            # already-dropped maximum. (The assymetry is because of how we sort.)
-            might_overlap_right = max_to_the_left
-            overlap_right = bisect.bisect_left(mins, might_overlap_right)
-
-            # A metric: how many bytes outside this buffer might overlap?
-            extraneousness = (np.sum(byte_counts[overlap_left:overlap_right]) - buff_size)
-            # If it's zero, we could sort in one pass.
-            if extraneousness > 0:
-                info.append((extraneousness, left_i, i, f"{overlap_left}<- {left_i} - {i + 1} ->{overlap_right} ({extraneousness:.01f})"))
-            buff_size -= left_size
-
-    info.sort(reverse = True)
-    return info
+    tables : List[Tablet] = []
+    with TemporaryDirectory(dir = ".") as tmp_dir:
+        chunked_tables = pass_1(iterator, keys, block_size, Path(tmp_dir))
+        # The central pass chunks into half the block size.
+        mostly_sorted = central_pass(chunked_tables, keys, block_size / 2)
+        swansong(mostly_sorted, Path(output), block_size, keys)
 
 
 if __name__=="__main__":
