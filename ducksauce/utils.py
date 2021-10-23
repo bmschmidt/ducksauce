@@ -200,6 +200,8 @@ def partition(array : List[Tablet], pivot : List[pa.Scalar]) -> Tuple[List[Table
             overlaps.append(arr)
     return before, overlaps, after
 
+
+
 def consume_tablets(*tablets : Tablet, keys = None):
     assert keys is not None
     for tablet in tablets:

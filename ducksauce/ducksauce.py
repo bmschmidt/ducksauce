@@ -110,7 +110,7 @@ def central_pass(inputs : List[Tablet], keys : List[str], max_overlaps : int = 1
         pivot = get_pivot(array, keys)
         # Split chunks into three: those below the pivot, those overlapping it, and those above.
         all_before, overlaps, all_after = partition(array, pivot)
-        print(f"{i:04d} COMPLETE: {sum(map(total_batch_size, sorted))}, SAFE: {total_batch_size(all_before)}, overlapping: {total_batch_size(overlaps)}, next: {total_batch_size(all_after)}, stack: {sum(map(total_batch_size, unsorted))}", end = "                                             \r")
+        logger.info(f"{i:04d} COMPLETE: {sum(map(total_batch_size, sorted))}, SAFE: {total_batch_size(all_before)}, overlapping: {total_batch_size(overlaps)}, next: {total_batch_size(all_after)}, stack: {sum(map(total_batch_size, unsorted))}")
         assert size == sum(map(total_batch_nrows, [all_before, all_after, overlaps]))
         s1 = []
         s2 = []
@@ -179,7 +179,7 @@ def swansong(sorted_nested : List[List[Tablet]], fout : Path, max_overlaps : int
             ixes = pc.sort_indices(lesser.table, sort_keys = [(k, "ascending") for k in keys])
             lesser = pc.take(lesser.table, ixes)
             writer.write_table(lesser)
-            print(f"{i:04d}: Flushed {lesser.nbytes} bytes with {total_batch_size(stack)} remaining in cache")
+            logger.info(f"{i:04d}: Flushed {lesser.nbytes / 1024 / 1024:.2f} megabytes with {total_batch_size(stack) / 1024 / 1024:.2f} MB carried in cache")
                 
     writer.close()
 
@@ -221,7 +221,6 @@ def from_files(files, keys: List[str], output: Union[Path, str], block_size = 2_
     
 def __main__():
     args = parse_args()
-    print(args)
     from_files(args.inputs, args.key, args.output, args.block_size)
 
 def parse_args():
@@ -297,13 +296,13 @@ def quacksort(iterator: Iterator[pa.RecordBatch], keys: List[str], output: Union
     """
 
     output = Path(output)
-    n_records = 0
-    # First pass--simply write to disk.
-    tables : List[Tablet] = []
     with TemporaryDirectory(dir = ".") as tmp_dir:
+        logger.info("Streaming initial files to disk")
         chunked_tables = pass_1(iterator, keys, block_size, Path(tmp_dir))
         # The central pass chunks into half the block size.
+        logger.info("Rechunking files for optimal in-memory sort")
         mostly_sorted = central_pass(chunked_tables, keys, block_size / 2)
+        logger.info("Sorting in-memory to file")
         swansong(mostly_sorted, Path(output), block_size, keys)
 
 
