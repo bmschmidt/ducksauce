@@ -41,14 +41,17 @@ def subcleave(patab : pa.Table, pivots : List[pa.Scalar], keys):
     lesser = pc.filter(patab, pc.less(patab[key], pivot))
     greater = pc.filter(patab, pc.greater(patab[key], pivot))
     eq = pc.filter(patab, pc.equal(patab[key], pivot))
-    
+    # pyarrow counts nulls as greater than any other values.
+    nulls = pc.filter(patab, pc.is_null(patab[key]))
+
     if len(pivots) == 1:
-        return lesser, pa.concat_tables([greater, eq])
+        return lesser, pa.concat_tables([greater, eq, nulls])
     
     lt, gt = subcleave(eq, pivots_left, keys_left)
+
     return (
         pa.concat_tables([lesser, lt]),
-        pa.concat_tables([greater, gt])
+        pa.concat_tables([greater, gt, nulls])
     )
 
 def cleave(tb : Tablet, pivots : List[pa.Scalar], keys : List[str]):
@@ -80,13 +83,19 @@ def split_into(tb : pa.Table, n : int, keys : List[str]) -> List[pa.Table]:
         # Pick a random pivot
         if len(current) <= 1:
             # Unlikey limit case.
+            logging.debug("Unlikely limit case hit.")
             tbs.append(current)
             break
         rix = random.randint(0, len(current)-1)    
         pivots = [current[k][rix] for k in keys]
+        current_length = len(current)
+        counter = 0
         for part in cleave(current, pivots, keys):
             if part is not None:
+                counter += len(part)
                 tbs.append(part)
+        print(counter, current_length)
+        assert counter == current_length
         current.destroy()
     return tbs
         # Sort by length so the next split is on the longest array
@@ -246,6 +255,7 @@ def ducksauce(input, **args):
       from_feather(input, **args)
 
 MINISIZE = 12
+
 def pass_1(iterator : Iterator[pa.RecordBatch], keys: List[str], block_size : int, tmpdir : Path):
     tables = []
     cache = []
@@ -266,6 +276,9 @@ def pass_1(iterator : Iterator[pa.RecordBatch], keys: List[str], block_size : in
                 subbatch.flush()
             cache = []
             cache_size = 0
+            print(n_records)
+            assert(n_records == sum([len(f) for f in tables]))
+
     # Flush the cache at the end.
     if len(cache) > 0:
         block = pa.Table.from_batches(cache)
@@ -278,6 +291,7 @@ def pass_1(iterator : Iterator[pa.RecordBatch], keys: List[str], block_size : in
             # Write it to disk and clear the memory version.
             subbatch.flush()
     assert len(tables) > 0
+    print(n_records, [len(f) for f in tables])
     assert(n_records == sum([len(f) for f in tables]))
     return tables
 

@@ -1,6 +1,5 @@
 import pytest
-from ducksauce import from_files
-from ducksauce.ducksauce import pass_1
+from ducksauce.ducksauce import pass_1, quacksort, from_files, swansong
 from ducksauce.utils import Tablet, tb_min, tb_max, flatten
 from pathlib import Path
 #from random import randint
@@ -33,6 +32,25 @@ def tmpdata(dir, n = 10000, maxint = 1000, batches = 5):
         p = Tablet(tb, dir, min, max, keys)
         tbs.append(p)
     return tbs
+  
+@pytest.fixture(scope="module")
+def char_batches():
+    # Letters: low of "A", high of "z"
+    chars = [chr(a) for a in random.randint(low = 65, high = 123, size = 100_000)]
+    dummy = ["A" for i in range(len(chars))]
+    tab = pa.table({
+      'dummy': pa.array(dummy, type=pa.string()),
+      'key': pa.array(chars, type=pa.string()),
+      'n': pa.array(np.arange(len(chars)), type=pa.int64())})
+    return tab.to_batches(block_size = 1_000)
+
+
+
+class TestInitialSort():
+  def test_character_pass_1(self, char_batches, tmp_path):
+    pass_1(char_batches, ["key"], 10_000, tmp_path)
+  def test_character_pass_1_with_dummy(self, char_batches, tmp_path):
+    pass_1(char_batches, ["dummy", "key"], 10_000, tmp_path)
 
 class Test_Safety():
   def test_pass_1_length(self, tmp_path):
@@ -75,4 +93,4 @@ class Test_Tokens():
     t = parquet.read_table(tmp_path / 'test2.parquet')
     indices = pc.sort_indices(t, sort_keys = [('dummy', 'ascending'), ('key', 'ascending')])
     assert indices[:10].to_pylist() == [ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
-    assert tab['key'][indices[0].as_py()] == pa.scalar('0')
+    assert t['key'][indices[0].as_py()] == pa.scalar('0')
