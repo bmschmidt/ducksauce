@@ -324,7 +324,7 @@ def pass_1(iterator : Iterator[pa.RecordBatch], keys: List[str], block_size : in
     return tables
 
 
-def quacksort(iterator: Iterator[pa.RecordBatch], keys: List[str], output: Union[Path, str], block_size = 2_500_000_000) -> None:
+def quacksort(iterator: Iterator[pa.RecordBatch], keys: List[str], output: Union[Path, str], block_size = 2_500_000_000, tmpdir: Union[Path, str] = ".") -> None:
     
     """
     Some kind of multi-pass sorting algorithm that aims to reduce useless ahead-
@@ -338,7 +338,7 @@ def quacksort(iterator: Iterator[pa.RecordBatch], keys: List[str], output: Union
     """
 
     output = Path(output)
-    with TemporaryDirectory(dir = ".") as tmp_dir:
+    with TemporaryDirectory(dir = str(tmpdir)) as tmp_dir:
         logger.info("Streaming initial files to disk")
         chunked_tables = pass_1(iterator, keys, block_size, Path(tmp_dir))
         # The central pass chunks into half the block size.
