@@ -77,7 +77,7 @@ class Test_Tokens():
       assert a <= b
 
 
-  def test_double_sort(self, tmp_path):
+  def test_dummy_double_sort(self, tmp_path):
     """
     Given a dummy column in the first position, is the second column sorted?
     """
@@ -91,6 +91,28 @@ class Test_Tokens():
     output = Path(tmp_path / 'test2.parquet')
     from_files([tmp_path / 'test.parquet'], keys = ['dummy', 'key'], output = output, block_size = 1000000)
     t = parquet.read_table(tmp_path / 'test2.parquet')
-    indices = pc.sort_indices(t, sort_keys = [('dummy', 'ascending'), ('key', 'ascending')])
+    indices = pc.sort_indices(t, sort_keys = [('dummy', 'ascending'),
+      ('key', 'ascending')])
+    # Does it align with a normal sort?
     assert indices[:10].to_pylist() == [ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
-    assert t['key'][indices[0].as_py()] == pa.scalar('0')
+
+  def test_true_double_sort(self, tmp_path):
+    """
+    Given a dummy column in the first position, is the second column sorted?
+    """
+    A = [str(a) for a in random.randint(low = 0, high = 1000, size = 100_000)]
+    B = [str(a) for a in random.randint(low = 0, high = 1000, size = 100_000)]
+
+    tab = pa.table({
+      'A': pa.array(A, type=pa.string()),
+      'B': pa.array(B, type=pa.string()),
+      'n': pa.array(np.arange(len(A)), type=pa.int64())})
+
+    parquet.write_table(tab, tmp_path / "test.parquet")
+    output = Path(tmp_path / 'test2.parquet')
+    from_files([tmp_path / 'test.parquet'], keys = ['A', 'B'], output = output, block_size = 50_000)
+    t = parquet.read_table(output)
+    indices = pc.sort_indices(t, sort_keys = [('A', 'ascending'),
+      ('B', 'ascending')])
+    # Does it align with a normal sort?
+    assert indices[:10].to_pylist() == [ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9]

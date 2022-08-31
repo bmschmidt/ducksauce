@@ -18,7 +18,7 @@ from .utils import total_batch_size, total_batch_nrows, min_val, max_val, tb_min
 
 logger = logging.getLogger("ducksauce")
 
-            
+"""            
 def tmpdata(n = 10000, maxint = 1000, batches = 5):
     tbs = []
     tmpdir = Path("/tmp/tablets")
@@ -32,22 +32,36 @@ def tmpdata(n = 10000, maxint = 1000, batches = 5):
         p = Tablet(tb, "/tmp/tablets", min, max, keys)
         tbs.append(p)
     return tbs
+"""
 
 def subcleave(patab : pa.Table, pivots : List[pa.Scalar], keys):
-    key, *keys_left = keys
-    pivot, *pivots_left = pivots
-    assert pivot.as_py is not None
-    
+    """
+    Handles the job of executive cleave on each individual sort key
+    one by one.
+    """
+    init = True
+    pivot = pa.scalar(True)
+    while init or pivot.as_py() is None:
+        try:
+            key, *keys = keys
+            pivot, *pivots = pivots
+        except ValueError:
+            # If all keys are null, there's no way
+            # to subdivide further--so just split it right down the middle.
+            pivot = random.randint(0, len(patab))
+            return patab.slice(0, pivot), patab.slice(pivot, len(patab))
+
     lesser = pc.filter(patab, pc.less(patab[key], pivot))
     greater = pc.filter(patab, pc.greater(patab[key], pivot))
     eq = pc.filter(patab, pc.equal(patab[key], pivot))
+
     # pyarrow counts nulls as greater than any other values.
     nulls = pc.filter(patab, pc.is_null(patab[key]))
 
-    if len(pivots) == 1:
+    if len(pivots) == 0:
         return lesser, pa.concat_tables([greater, eq, nulls])
     
-    lt, gt = subcleave(eq, pivots_left, keys_left)
+    lt, gt = subcleave(eq, pivots, keys)
 
     return (
         pa.concat_tables([lesser, lt]),
@@ -61,7 +75,8 @@ def cleave(tb : Tablet, pivots : List[pa.Scalar], keys : List[str]):
     """
     assert isinstance(tb, Tablet)
     lesser, greater = subcleave(tb.table, pivots, keys)
-    
+    if lesser is not None and greater is not None:
+        assert len(lesser) + len(greater) == len(tb)
     greater = Tablet(greater, tb.path.parent, min = tb_min(greater, keys), max = tb_max(greater, keys), keys = keys)
     lesser = Tablet(lesser, tb.path.parent, min = tb_min(lesser, keys), max = tb_max(lesser, keys), keys = keys)
     if len(greater) == 0:
@@ -76,17 +91,26 @@ def cleave(tb : Tablet, pivots : List[pa.Scalar], keys : List[str]):
     return lesser, greater
 
 def split_into(tb : pa.Table, n : int, keys : List[str]) -> List[pa.Table]:
+    """
+    Splits a tablet into n tablets sorted by the given keys.
+
+    Takes 
+
+    tb: the input table
+    n: the number of tablets to split into
+    keys: the keys to sort by
+    """
     tbs = [tb]
     for i in range(n):
         tbs.sort(key = lambda x: -len(x))
         current = tbs.pop(0)
-        # Pick a random pivot
         if len(current) <= 1:
             # Unlikey limit case.
             logging.debug("Unlikely limit case hit.")
             tbs.append(current)
             break
-        rix = random.randint(0, len(current)-1)    
+        # Pick a random pivot inside this array.
+        rix = random.randint(0, len(current) - 1)
         pivots = [current[k][rix] for k in keys]
         current_length = len(current)
         counter = 0
@@ -94,8 +118,11 @@ def split_into(tb : pa.Table, n : int, keys : List[str]) -> List[pa.Table]:
             if part is not None:
                 counter += len(part)
                 tbs.append(part)
-        print(counter, current_length)
-        assert counter == current_length
+        try:
+            assert counter == current_length
+        except AssertionError:
+            logger.error(f"Counter: {counter}, Current Length: {current_length}")
+            raise
         current.destroy()
     return tbs
         # Sort by length so the next split is on the longest array
@@ -126,9 +153,10 @@ def central_pass(inputs : List[Tablet], keys : List[str], max_overlaps : int = 1
         while total_batch_size(overlaps) > max_overlaps:
             current = overlaps.pop()
             before, eq_or_after = cleave(current, pivot, keys)
-            s1.append(before)
-            s2.append(eq_or_after)
-
+            if before is not None:
+                s1.append(before)
+            if eq_or_after is not None:
+                s2.append(eq_or_after)
             if total_batch_size(s1) > max_overlaps:
                 t = consume_tablets(*s1, keys = keys)
                 ts = split_into(t, MINISIZE, keys)
@@ -161,8 +189,10 @@ def central_pass(inputs : List[Tablet], keys : List[str], max_overlaps : int = 1
 def swansong(sorted_nested : List[List[Tablet]], fout : Path, max_overlaps : int, keys : List[str]) -> None:
     """
     The last portion of the sort is simple--just move left to 
-    right sorting each portion in turn, secure in the knowledge 
-    that you won't run out.
+    right sorting each portion in turn and appending the end to an
+    overflow buffer,
+    secure in the knowledge 
+    that the overflow buffer won't get too big.
     """
     if fout.suffix == ".feather":
         writer = ipc.new_file(fout, sorted_nested[0][0].schema)
@@ -274,10 +304,9 @@ def pass_1(iterator : Iterator[pa.RecordBatch], keys: List[str], block_size : in
                 tables.append(subbatch)
                 # Write it to disk and clear the memory version.
                 subbatch.flush()
+            tab.destroy()
             cache = []
             cache_size = 0
-            print(n_records)
-            assert(n_records == sum([len(f) for f in tables]))
 
     # Flush the cache at the end.
     if len(cache) > 0:
@@ -291,7 +320,6 @@ def pass_1(iterator : Iterator[pa.RecordBatch], keys: List[str], block_size : in
             # Write it to disk and clear the memory version.
             subbatch.flush()
     assert len(tables) > 0
-    print(n_records, [len(f) for f in tables])
     assert(n_records == sum([len(f) for f in tables]))
     return tables
 
